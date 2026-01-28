@@ -24,6 +24,9 @@ http://xhslink.com/o/1PzmIRnbC6L
    ```
 3. **Buzz** (推荐，用于生成准确的 SRT 字幕)
    - 下载: https://github.com/chidiwilliams/buzz
+4. 安装Google Generative AI SDK依赖
+   ```pip install -r requirements.txt
+   ```
 
 ### 安装 Skill
 
