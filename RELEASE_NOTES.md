@@ -1,75 +1,89 @@
 # Release Notes
 
-## v1.0.0 (2026-01-26)
+## v1.0.0 - 2025-01-30
 
-### 新功能
+### Overview
 
-- **双语字幕生成**: 支持 6 种语言组合 (en-cn, ja-cn, en-ja, ja-en, cn-en, cn-ja)
-- **视频烧录**: 使用 ffmpeg + libass 将字幕硬烧录到视频
-- **Netflix 风格样式**: 白色文字 + 半透明黑色背景框
-- **多分辨率支持**: 针对 1080p/1440p/4K 优化的参数
+Bilingual Subtitle Video Generator 是一个 Claude Code Skill，实现了从单语 SRT 字幕到双语硬字幕视频的全自动化流水线。
 
-### 技术细节
+### Development Timeline
 
-#### 最终确定的 4K 参数
-经过多轮测试，确定最佳参数：
-- **FontSize**: 16
-- **MarginV**: 10
-- **FontName**: PingFang SC (支持中日英混排)
+#### Phase 1: Skill 设计与创建
 
-#### Shell 转义问题解决方案
-ffmpeg 的颜色参数 `&H00FFFFFF` 中的 `&` 符号会被 shell 错误解析。解决方案是使用 heredoc 创建临时脚本：
+基于已有的 `bilingual-subtitle` skill 经验，设计了新的完整工作流：
 
-```bash
-cat > /tmp/burn_subtitle.sh << 'SCRIPT'
-#!/bin/bash
-/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg -y \
-  -i "$1" \
-  -vf "subtitles=$2:force_style='FontName=PingFang SC,FontSize=16,...'" \
-  -c:a copy \
-  "$3"
-SCRIPT
+```
+SRT 字幕 → Gemini 翻译 → 双语 SRT → 用户确认 → FFmpeg 烧录 → 成品视频
 ```
 
-#### 字幕来源建议
-| 来源 | 推荐程度 | 原因 |
-|------|---------|------|
-| Buzz/Whisper | 推荐 | 时间轴准确不重叠 |
-| YouTube 自动字幕 | 不推荐 | 时间轴经常重叠 |
+创建 `SKILL.md`，定义了两阶段工作流程、分辨率参数对照表、FFmpeg 脚本模板和故障排除指南。
 
-### 已知问题
+#### Phase 2: 实战测试
 
-- 1080p 和 1440p 参数未经充分测试，可能需要微调
-- 暂不支持竖屏视频的参数优化
+使用测试素材 "Clawdbot Peter Steinberger Makes First Public Appearance Since Launch"（36 分钟，1080p）进行端到端测试。
 
-### 开发历程
+**第一阶段测试 - 双语字幕生成：**
+- 输入：1419 行英文 SRT
+- Python 脚本分 24 个块通过 Gemini API 处理
+- 遇到 503 (model overloaded) 错误，重试机制成功处理
+- 输出：2300 行英中双语 SRT
 
-本 Skill 由 Ben 与 Claude (Opus 4.5) 协作开发，经历了：
+**第二阶段测试 - FFmpeg 烧录：**
+- 自动检测视频分辨率 1920x1080
+- 通过 `/tmp/burn_subtitle.sh` 脚本执行（避免 `&` 解析问题）
+- 使用 ffmpeg-full 8.0.1（含 libass）
+- 成功输出 441MB 带字幕视频
 
-1. **初始设计**: 确定两步工作流 (翻译 → 烧录)
-2. **ffmpeg 配置**: 解决 libass 依赖问题 (`brew install ffmpeg-full`)
-3. **英文视频测试**: DeepMind CEO 访谈视频 (1080p) - 成功
-4. **日文视频测试**: Comandante 咖啡器具视频 (4K) - 发现多个问题
-5. **时间轴问题**: 发现 YouTube 自动字幕重叠问题，改用 Buzz/Whisper
-6. **样式调试**: 解决 `&` 符号转义导致的黑色块问题
-7. **参数优化**: 多轮测试确定 4K 最佳参数 (FontSize=16, MarginV=10)
+#### Phase 3: 脚本升级 (bilingual_subtitle_generator.py)
 
-### 版本迭代记录
+基于测试反馈，对 Python 脚本进行了重大升级：
 
-| 版本 | FontSize | MarginV | 问题 |
-|------|----------|---------|------|
-| v5 | 28 | 35 | 字号太大，位置太高 |
-| v6 | 20 | 55 | 字号稍大，位置未变 |
-| v8 | 18 | 80 | 字号OK，位置太高 |
-| v9 | 18 | 30 | 位置稍高 |
-| v10 | 18 | 20 | 位置稍高 |
-| v11 | 16 | 10 | **完美** |
+1. **ASR 纠错系统**：新增 `VIDEO_KEYWORDS` 术语表，通过 System Prompt 注入，自动修正语音识别错误（如 "white coding" → "vibe coding"）
+2. **大块处理优化**：`CHUNK_SIZE` 从 60 提升至 300，减少分块次数（24 块 → 约 5 块），显著提升翻译连贯性
+3. **Temperature 控制**：设置 `temperature=0.1`，降低模型幻觉概率
+4. **字号调优**：1080p 视频 FontSize 从 12 调整为 14，改善可读性
 
----
+#### Phase 4: GitHub 发布准备
 
-## 未来计划
+1. **安全处理**：将硬编码 API Key 替换为环境变量 + `.env` 文件方案
+2. **`.gitignore`**：排除 `.env`、`__pycache__`、`.venv`、视频/JSON 输出文件、`.DS_Store`
+3. **`.env.example`**：提供 API Key 配置模板
+4. **`burn_subtitle.sh`**：独立的 FFmpeg 烧录脚本，包含参数校验和 ffmpeg-full 检查
 
-- [ ] 支持更多语言 (韩语、西班牙语等)
-- [ ] 竖屏视频参数优化
-- [ ] 字幕样式主题 (Netflix/YouTube/Disney+)
-- [ ] 批量处理多个视频
+### Key Decisions & Lessons Learned
+
+| Issue | Solution |
+|-------|----------|
+| FFmpeg `&` 符号被 shell 错误解析 | 必须使用脚本文件执行，不能内联命令 |
+| 标准 ffmpeg 缺少 libass | 使用 `brew install ffmpeg-full` |
+| ASR 转录错误（人名、产品名） | VIDEO_KEYWORDS 术语表 + System Prompt 注入 |
+| 翻译分块导致上下文断裂 | CHUNK_SIZE 从 60 提升至 300 |
+| 翻译出现幻觉/过度意译 | temperature 降至 0.1 |
+| 1080p 字幕偏小 | FontSize 从 12 调整为 14 |
+| API Key 泄露风险 | 环境变量 + .env + .gitignore |
+
+### File Structure
+
+```
+bilingual-subtitle-video-generator/
+├── SKILL.md                          # Claude Code Skill 定义文档
+├── bilingual_subtitle_generator.py   # Gemini 双语字幕生成脚本
+├── burn_subtitle.sh                  # FFmpeg 字幕烧录脚本
+├── .env.example                      # API Key 配置模板
+├── .gitignore                        # Git 忽略规则
+└── RELEASE_NOTES.md                  # 本文档
+```
+
+### Prerequisites
+
+- **Python 3.x** + `google-genai` SDK
+- **ffmpeg-full**: `brew install ffmpeg-full` (macOS, 需含 libass)
+- **Google AI Studio API Key**: [获取地址](https://aistudio.google.com/apikey)
+
+### Resolution Presets
+
+| Resolution | FontSize | MarginV |
+|-----------|----------|---------|
+| 1080p     | 14       | 8       |
+| 1440p     | 14       | 9       |
+| 4K        | 16       | 10      |
