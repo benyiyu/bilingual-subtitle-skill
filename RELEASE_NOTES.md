@@ -1,5 +1,115 @@
 # Release Notes
 
+## v2.0.0 - 2026-02-03
+
+### Overview
+
+Major upgrade: CLI 工具化、自动关键词提取、增量保存、指数退避重试、自动分辨率检测、硬件加速支持。消除了 Claude Code 手动编辑脚本配置和读取 SRT 全文的步骤，大幅减少 token 消耗和操作复杂度。
+
+### Breaking Changes
+
+- `bilingual_subtitle_generator.py` 现在通过命令行参数接收文件路径，不再使用脚本内硬编码的 `INPUT_FILE`/`OUTPUT_*` 变量
+- `burn_subtitle.sh` 参数从 5 个改为 3 个（+可选 `--hwaccel`），FontSize/MarginV 由脚本自动检测
+- `VIDEO_KEYWORDS` 硬编码术语表已移除，改为 Gemini 自动提取
+- `SKILL.md` 中 `allowed-tools` 移除了 `Write` 和 `Edit`（不再需要编辑脚本）
+
+### Changes
+
+#### 1. bilingual_subtitle_generator.py — CLI 工具化
+
+**旧用法**（需要 Claude Code 编辑脚本）：
+```python
+# 每次需要手动修改这些变量
+INPUT_FILE = "/path/to/input.srt"
+OUTPUT_JSON = "/path/to/output.json"
+OUTPUT_SRT = "/path/to/output.srt"
+VIDEO_KEYWORDS = """..."""
+```
+
+**新用法**（纯命令行参数）：
+```bash
+python bilingual_subtitle_generator.py --input "/path/to/input.srt"
+# 输出自动生成 _bilingual.srt / _bilingual.json
+```
+
+**Why**: 消除 Claude Code 每次需要 Edit 工具修改配置的步骤，节省 ~3K tokens/次。
+
+#### 2. 自动关键词提取 (Phase 0)
+
+翻译前自动读取 SRT 前 200 行，通过 Gemini API 分析内容，提取人名、机构名、产品名、专业术语等关键词，注入后续翻译的 System Prompt。
+
+**Why**: 消除 Claude Code 需要读取 SRT 全文 → 理解内容 → 手写 VIDEO_KEYWORDS 的步骤。这是 v1.0 最大的 token 浪费项（~20K tokens 用于读 SRT + 生成关键词）。
+
+#### 3. 模型更改
+
+```
+旧: gemini-3-flash-preview
+新: gemini-2.0-flash
+```
+
+**Why**: preview 模型不稳定，v1.0 测试中 chunk 4 连续 3 次 "Server disconnected"。正式版稳定性更好。
+
+#### 4. 指数退避重试
+
+```
+旧: 固定 time.sleep(5)，最多 3 次重试
+新: 5 → 15 → 45 → 90 → 180 秒，最多 5 次重试
+```
+
+**Why**: 固定 5 秒等待对服务器过载无效。指数退避给服务器恢复时间。
+
+#### 5. 增量保存 (Checkpoint)
+
+每处理完一个 chunk，立即保存到 `_checkpoint.json`。重新运行时自动检测 checkpoint 文件，跳过已完成的 chunk，从断点续传。所有 chunk 完成后自动清理 checkpoint 文件。
+
+**Why**: v1.0 中 chunk 失败后需要手动写补丁脚本重跑 + 合并。现在直接重跑即可。
+
+#### 6. burn_subtitle.sh — 自动分辨率检测
+
+**旧用法**（5 个参数，需手动查参数表）：
+```bash
+./burn_subtitle.sh <video> <srt> <font_size> <margin_v> <output>
+```
+
+**新用法**（3 个参数，自动检测）：
+```bash
+./burn_subtitle.sh <video> <srt> <output> [--hwaccel]
+```
+
+脚本内部调用 ffprobe 检测分辨率，根据 1080p/1440p/4K 自动选择 FontSize 和 MarginV。
+
+#### 7. 硬件加速
+
+新增 `--hwaccel` 选项，使用 `h264_videotoolbox`（macOS）。4K 软编码需数十分钟，硬件加速可显著缩短。
+
+#### 8. 字体路径
+
+新增 `fontsdir` 参数指定系统字体目录 (`/System/Library/Fonts`)，避免 macOS 字体访问权限警告。
+
+#### 9. SKILL.md 简化
+
+Claude Code 的工作从 "读 SRT → 编辑脚本配置 → 运行 → 手动修复" 简化为 "执行 CLI 命令 → 预览 → 确认烧录"。
+
+移除的步骤：
+- 修改脚本配置（INPUT_FILE 等）
+- 编辑 VIDEO_KEYWORDS 术语表
+- 手动检测视频分辨率
+- 手动选择 FontSize/MarginV
+
+新增指令：
+- 使用 `run_in_background` 运行 FFmpeg，不轮询进度
+- 失败后直接重跑脚本（checkpoint 自动续传）
+
+### Token Savings Estimate
+
+| 步骤 | v1.0 消耗 | v2.0 消耗 | 节省 |
+|------|-----------|-----------|------|
+| 编辑脚本配置 | ~3K tokens | 0 | 3K |
+| 读 SRT + 写关键词 | ~20K tokens | 0 | 20K |
+| 手动检测分辨率 | ~1K tokens | 0 | 1K |
+| 查参数表选参数 | ~500 tokens | 0 | 500 |
+| **合计** | | | **~24.5K tokens/次** |
+
 ## v1.0.0 - 2025-01-30
 
 ### Overview
