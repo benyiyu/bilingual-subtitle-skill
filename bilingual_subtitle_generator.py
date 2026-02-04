@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-Bilingual Subtitle Generator v2.1
+Bilingual Subtitle Generator v2.2
 
 CLI tool that generates Netflix-level bilingual subtitles from SRT files
 using Google Gemini API with automatic keyword extraction and checkpoint resume.
+
+v2.2 improvements:
+- Keywords cached in checkpoint (no re-extraction on resume)
+- Sample-based keyword extraction for long transcripts (>1000 lines)
+- Adaptive inter-chunk delay (scales up on errors, resets on success)
+- 429 rate-limit specific handling with extended cooldowns
+- Configurable --chunk-size CLI parameter
+- Global error budget: pipeline pauses after consecutive failures
 
 Usage:
     python bilingual_subtitle_generator.py --input "/path/to/input.srt"
     python bilingual_subtitle_generator.py --input "/path/to/input.srt" --output-srt "/path/to/out.srt" --output-json "/path/to/out.json"
     python bilingual_subtitle_generator.py --input "/path/to/input.srt" --keywords "Clawd:AI assistant, Claude Code:coding tool"
     python bilingual_subtitle_generator.py --input "/path/to/input.srt" --model gemini-2.5-flash
+    python bilingual_subtitle_generator.py --input "/path/to/input.srt" --chunk-size 100
 """
 
 import os
@@ -25,8 +34,15 @@ from google.genai import types
 # ================= Constants =================
 DEFAULT_MODEL = "gemini-2.5-flash"
 FALLBACK_MODEL = "gemini-3-flash-preview"
-CHUNK_SIZE = 150
+DEFAULT_CHUNK_SIZE = 150
 BACKOFF_SCHEDULE = [5, 15, 45, 90, 180]  # seconds, up to 5 retries
+RATE_LIMIT_COOLDOWN = 60  # seconds to wait on 429 before resuming retries
+KEYWORD_SAMPLE_THRESHOLD = 1000  # lines; above this, use sampling for keyword extraction
+KEYWORD_SAMPLE_LINES = 300  # lines to sample from each section (begin/mid/end)
+CONSECUTIVE_FAIL_LIMIT = 3  # global error budget: pause after this many consecutive chunk failures
+GLOBAL_PAUSE_DURATION = 120  # seconds to pause when global error budget is exhausted
+MIN_CHUNK_DELAY = 2  # seconds, base delay between chunks
+MAX_CHUNK_DELAY = 30  # seconds, max adaptive delay between chunks
 # ==============================================
 
 
@@ -75,6 +91,11 @@ def parse_args():
         "--model", default=DEFAULT_MODEL,
         help=f"Gemini model to use (default: {DEFAULT_MODEL})"
     )
+    parser.add_argument(
+        "--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
+        help=f"Number of SRT lines per chunk (default: {DEFAULT_CHUNK_SIZE}). "
+             "Smaller values = smaller API requests = more resilient but more calls."
+    )
     args = parser.parse_args()
 
     # Auto-generate output paths if not specified
@@ -116,12 +137,41 @@ def parse_manual_keywords(keywords_str):
     return "\n".join(lines)
 
 
+def _sample_lines(all_lines, threshold=KEYWORD_SAMPLE_THRESHOLD, sample_size=KEYWORD_SAMPLE_LINES):
+    """For long transcripts, sample beginning/middle/end instead of sending everything."""
+    if len(all_lines) <= threshold:
+        return all_lines
+    mid_start = max(0, len(all_lines) // 2 - sample_size // 2)
+    begin = all_lines[:sample_size]
+    middle = all_lines[mid_start:mid_start + sample_size]
+    end = all_lines[-sample_size:]
+    # Deduplicate while preserving order
+    seen = set()
+    sampled = []
+    for line in begin + middle + end:
+        if line not in seen:
+            seen.add(line)
+            sampled.append(line)
+    return sampled
+
+
+def _is_rate_limit_error(error):
+    """Check if an exception is a 429 rate-limit error."""
+    err_str = str(error)
+    return "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+
+
 def extract_keywords(client, all_lines, model_name):
     """
-    Phase 0: Send full SRT text to Gemini to auto-extract keywords.
+    Phase 0: Extract keywords from transcript using Gemini.
+    For long transcripts (>KEYWORD_SAMPLE_THRESHOLD lines), samples
+    beginning/middle/end instead of sending the full text.
     Returns a keyword string for injection into the translation system prompt.
     """
-    sample = "\n".join(all_lines)
+    sampled = _sample_lines(all_lines)
+    sample = "\n".join(sampled)
+    if len(sampled) < len(all_lines):
+        print(f"  Transcript too long ({len(all_lines)} lines), sampling {len(sampled)} lines for keyword extraction.")
 
     keyword_prompt = """Analyze this SRT subtitle transcript sample. Extract all important keywords that need special attention during translation, including:
 
@@ -184,8 +234,13 @@ Only include terms that genuinely appear or are referenced in the transcript. Do
         except Exception as e:
             print(f"  Keyword extraction attempt {attempt + 1}/{len(BACKOFF_SCHEDULE)} failed: {e}")
             if attempt < len(BACKOFF_SCHEDULE) - 1:
-                print(f"  Retrying in {wait}s...")
-                time.sleep(wait)
+                if _is_rate_limit_error(e):
+                    cooldown = max(wait, RATE_LIMIT_COOLDOWN)
+                    print(f"  Rate limit hit. Cooling down for {cooldown}s...")
+                    time.sleep(cooldown)
+                else:
+                    print(f"  Retrying in {wait}s...")
+                    time.sleep(wait)
 
     print("  Keyword extraction failed after all retries. Proceeding without keywords.")
     return ""
@@ -226,7 +281,7 @@ Your task is to process raw ASR (speech-to-text) transcripts. The transcripts ma
 
 
 def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks, model_name):
-    """Call Gemini API to process a single chunk with exponential backoff."""
+    """Call Gemini API to process a single chunk with exponential backoff and 429 handling."""
     print(f"Processing chunk {chunk_index}/{total_chunks} ({len(chunk_text)} chars) with {model_name}...")
 
     config = types.GenerateContentConfig(
@@ -241,6 +296,7 @@ def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks, 
         ]
     )
 
+    last_error = None
     for attempt, wait in enumerate(BACKOFF_SCHEDULE):
         try:
             response = client.models.generate_content(
@@ -254,11 +310,17 @@ def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks, 
                 return data
             print(f"  Unexpected response format, retrying...")
         except Exception as e:
+            last_error = e
             print(f"  Attempt {attempt + 1}/{len(BACKOFF_SCHEDULE)} failed: {e}")
 
         if attempt < len(BACKOFF_SCHEDULE) - 1:
-            print(f"  Retrying in {wait}s...")
-            time.sleep(wait)
+            if last_error and _is_rate_limit_error(last_error):
+                cooldown = max(wait, RATE_LIMIT_COOLDOWN)
+                print(f"  Rate limit hit. Cooling down for {cooldown}s...")
+                time.sleep(cooldown)
+            else:
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
 
     return None
 
@@ -272,7 +334,7 @@ def get_checkpoint_path(output_json):
 
 
 def load_checkpoint(checkpoint_path):
-    """Load checkpoint if exists, return (completed_chunks set, subtitles list, total_chunks)."""
+    """Load checkpoint if exists, return (completed_chunks set, subtitles list, total_chunks, cached_keywords)."""
     if os.path.exists(checkpoint_path):
         try:
             with open(checkpoint_path, 'r', encoding='utf-8') as f:
@@ -280,20 +342,28 @@ def load_checkpoint(checkpoint_path):
             completed = set(data.get("completed_chunks", []))
             subtitles = data.get("subtitles", [])
             total = data.get("total_chunks", 0)
+            keywords = data.get("keywords", None)
+            chunk_size = data.get("chunk_size", None)
             print(f"Checkpoint found: {len(completed)}/{total} chunks completed. Resuming...")
-            return completed, subtitles, total
+            if keywords is not None:
+                print(f"  Using cached keywords from checkpoint.")
+            return completed, subtitles, total, keywords, chunk_size
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Checkpoint file corrupted, starting fresh: {e}")
-    return set(), [], 0
+    return set(), [], 0, None, None
 
 
-def save_checkpoint(checkpoint_path, completed_chunks, subtitles, total_chunks):
-    """Save current progress to checkpoint file."""
+def save_checkpoint(checkpoint_path, completed_chunks, subtitles, total_chunks, keywords=None, chunk_size=None):
+    """Save current progress to checkpoint file, including cached keywords."""
     data = {
         "completed_chunks": sorted(list(completed_chunks)),
         "subtitles": subtitles,
-        "total_chunks": total_chunks
+        "total_chunks": total_chunks,
     }
+    if keywords is not None:
+        data["keywords"] = keywords
+    if chunk_size is not None:
+        data["chunk_size"] = chunk_size
     with open(checkpoint_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -373,10 +443,27 @@ def main():
         print("Error: Input file is empty or unreadable.")
         exit(1)
 
-    # Phase 0: Auto keyword extraction + manual keywords
     model_name = args.model
+    chunk_size = args.chunk_size
     print(f"Using model: {model_name} (fallback: {FALLBACK_MODEL})")
-    video_keywords = extract_keywords(client, all_lines, model_name)
+    print(f"Chunk size: {chunk_size} lines")
+
+    # Load checkpoint first to check for cached keywords
+    checkpoint_path = get_checkpoint_path(args.output_json)
+    completed_chunks, full_subtitles, saved_total, cached_keywords, saved_chunk_size = load_checkpoint(checkpoint_path)
+
+    # If chunk size changed from checkpoint, reset chunk progress but preserve cached keywords
+    if saved_chunk_size is not None and saved_chunk_size != chunk_size:
+        print(f"Chunk size changed ({saved_chunk_size} -> {chunk_size}), resetting chunk progress (keywords preserved).")
+        completed_chunks = set()
+        full_subtitles = []
+
+    # Phase 0: Auto keyword extraction (use cache if available)
+    if cached_keywords is not None:
+        video_keywords = cached_keywords
+        print(f"Phase 0: Using cached keywords from checkpoint.")
+    else:
+        video_keywords = extract_keywords(client, all_lines, model_name)
 
     # Merge manual keywords if provided
     manual_kw = parse_manual_keywords(args.keywords)
@@ -390,27 +477,23 @@ def main():
     system_prompt = build_system_prompt(video_keywords)
 
     # Chunk the input
-    chunks = [all_lines[i:i + CHUNK_SIZE] for i in range(0, len(all_lines), CHUNK_SIZE)]
+    chunks = [all_lines[i:i + chunk_size] for i in range(0, len(all_lines), chunk_size)]
     total_chunks = len(chunks)
     print(f"\nTotal: {len(all_lines)} lines, {total_chunks} chunks.")
 
-    # Load checkpoint
-    checkpoint_path = get_checkpoint_path(args.output_json)
-    completed_chunks, full_subtitles, saved_total = load_checkpoint(checkpoint_path)
-
-    # If chunk count changed (different file), reset checkpoint
+    # If chunk count changed (different file or different chunk size), reset checkpoint
     if saved_total and saved_total != total_chunks:
-        print("Chunk count changed, resetting checkpoint.")
+        print(f"Chunk count changed ({saved_total} -> {total_chunks}), resetting chunk progress.")
         completed_chunks = set()
         full_subtitles = []
 
-    # Process chunks
-    # Build ordered subtitle collection: keep existing results, fill in gaps
-    chunk_results = {}
-    if completed_chunks and full_subtitles:
-        # Reconstruct per-chunk results from saved subtitles
-        # We store all subtitles flat, so on resume we keep them and only append new ones
-        pass
+    # Save keywords to checkpoint immediately so they survive restarts
+    save_checkpoint(checkpoint_path, completed_chunks, full_subtitles, total_chunks,
+                    keywords=video_keywords, chunk_size=chunk_size)
+
+    # Adaptive delay and global error budget state
+    current_delay = MIN_CHUNK_DELAY
+    consecutive_failures = 0
 
     for idx, chunk in enumerate(chunks):
         if idx in completed_chunks:
@@ -428,14 +511,35 @@ def main():
         if result:
             full_subtitles.extend(result)
             completed_chunks.add(idx)
-            save_checkpoint(checkpoint_path, completed_chunks, full_subtitles, total_chunks)
-            print(f"  Chunk {idx + 1} saved to checkpoint.")
+            save_checkpoint(checkpoint_path, completed_chunks, full_subtitles, total_chunks,
+                            keywords=video_keywords, chunk_size=chunk_size)
+            remaining = total_chunks - len(completed_chunks)
+            print(f"  Chunk {idx + 1} saved. Progress: {len(completed_chunks)}/{total_chunks} ({remaining} remaining)")
+            # Reset adaptive delay and error budget on success
+            current_delay = MIN_CHUNK_DELAY
+            consecutive_failures = 0
         else:
+            consecutive_failures += 1
+            # Increase adaptive delay on failure
+            current_delay = min(current_delay * 2, MAX_CHUNK_DELAY)
             print(f"WARNING: Chunk {idx + 1} failed after all retries (both models), skipped.")
+            print(f"  Consecutive failures: {consecutive_failures}/{CONSECUTIVE_FAIL_LIMIT}")
 
-        # Brief pause between chunks to avoid rate limiting
-        if idx < len(chunks) - 1:
-            time.sleep(2)
+            # Global error budget: pause pipeline after too many consecutive failures
+            if consecutive_failures >= CONSECUTIVE_FAIL_LIMIT:
+                print(f"\n{'!' * 40}")
+                print(f"  Global error budget exhausted ({consecutive_failures} consecutive failures).")
+                print(f"  Pausing pipeline for {GLOBAL_PAUSE_DURATION}s to let API recover...")
+                print(f"  Progress saved. You can also Ctrl+C and resume later.")
+                print(f"{'!' * 40}\n")
+                time.sleep(GLOBAL_PAUSE_DURATION)
+                consecutive_failures = 0  # reset after pause
+                current_delay = MIN_CHUNK_DELAY
+
+        # Adaptive delay between chunks
+        if idx < len(chunks) - 1 and (idx + 1) not in completed_chunks:
+            print(f"  Waiting {current_delay}s before next chunk...")
+            time.sleep(current_delay)
 
     # Export results
     output_dir = os.path.dirname(args.output_json)
@@ -453,6 +557,10 @@ def main():
     if len(completed_chunks) == total_chunks and os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
         print("All chunks completed, checkpoint removed.")
+    else:
+        skipped = total_chunks - len(completed_chunks)
+        print(f"\nWARNING: {skipped} chunk(s) were skipped due to errors.")
+        print(f"  Re-run the same command to retry failed chunks (checkpoint preserved).")
 
     print(f"\n{'=' * 40}")
     print(f"Done! Output files:")

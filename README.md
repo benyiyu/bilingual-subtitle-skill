@@ -6,10 +6,17 @@
 
 - **CLI 工具化**：通过命令行参数传入文件路径，无需手动编辑脚本配置
 - **自动关键词提取**：Gemini 自动分析字幕内容，提取人名、术语、品牌名等关键词用于 ASR 纠错
-- **ASR 纠错**：基于自动提取的术语表，修正语音识别错误（如 "white coding" → "vibe coding"）
+- **采样式关键词提取**：长 transcript（>1000 行）自动采样开头/中间/结尾，避免超大请求失败
+- **关键词缓存**：提取结果保存到 checkpoint，resume 时直接复用，不重复调用 API
+- **手动术语注入**：`--keywords` 参数补充自动提取遗漏的专业术语
+- **ASR 纠错**：基于术语表修正语音识别错误（如 "white coding" → "vibe coding"）
 - **Netflix 标准分段**：英文每行不超过 42 个字符，按语义完整切分
-- **指数退避重试**：5→15→45→90→180 秒，最多 5 次重试，应对 API 过载
+- **指数退避重试**：5→15→45→90→180 秒，最多 5 次重试，429 限流自动延长冷却至 60 秒
 - **增量保存 (Checkpoint)**：每处理完一个 chunk 立即保存进度，中断后重跑自动续传
+- **备用模型自动切换**：主模型失败后自动尝试备用模型（gemini-3-flash-preview）
+- **全局错误预算**：连续 3 个 chunk 失败后暂停 120 秒，避免配额雪崩
+- **自适应延迟**：chunk 间延迟根据成功/失败自动调整（2s～30s）
+- **可配置 chunk 大小**：`--chunk-size` 参数调整请求粒度
 - **自动分辨率检测**：烧录脚本自动检测视频分辨率，选择对应的字号和边距
 - **硬件加速**：可选 `--hwaccel` 使用 macOS h264_videotoolbox 加速编码
 - **Netflix 风格字幕样式**：白色字体 + 半透明黑色背景，PingFang SC 字体，底部居中
@@ -92,9 +99,19 @@ python bilingual_subtitle_generator.py \
   --input "/path/to/input.srt" \
   --output-srt "/path/to/bilingual.srt" \
   --output-json "/path/to/bilingual.json"
+
+# 手动补充术语 + 指定模型
+python bilingual_subtitle_generator.py \
+  --input "/path/to/input.srt" \
+  --keywords "Clawd:AI助手, Claude Code:编码工具"
+
+# 长视频使用较小 chunk（更不容易失败）
+python bilingual_subtitle_generator.py \
+  --input "/path/to/long_video.srt" \
+  --chunk-size 100
 ```
 
-如果中途失败，直接重跑同一命令，checkpoint 自动续传已完成的 chunk。
+如果中途失败，直接重跑同一命令，checkpoint 自动续传已完成的 chunk（关键词也会从缓存加载）。
 
 #### 第二阶段：烧录字幕到视频
 
@@ -108,14 +125,28 @@ python bilingual_subtitle_generator.py \
 
 ## Configuration
 
-### 脚本参数
+### CLI 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL_NAME` | gemini-2.0-flash | Gemini 模型（正式版，稳定） |
-| `CHUNK_SIZE` | 300 | 每块处理的行数 |
-| `KEYWORD_SAMPLE_LINES` | 200 | 用于关键词提取的样本行数 |
+| `--input` | （必填） | 输入 SRT 文件路径 |
+| `--output-srt` | `<input>_bilingual.srt` | 输出双语 SRT 路径 |
+| `--output-json` | `<input>_bilingual.json` | 输出双语 JSON 路径 |
+| `--keywords` | 无 | 手动术语注入，格式 `term:desc, term:desc` |
+| `--model` | `gemini-2.5-flash` | Gemini 模型（备用: `gemini-3-flash-preview`） |
+| `--chunk-size` | 150 | 每块行数，越小请求越轻量但调用次数越多 |
+
+### 内部常量
+
+| 常量 | 值 | 说明 |
+|------|---|------|
 | `BACKOFF_SCHEDULE` | [5, 15, 45, 90, 180] | 指数退避重试间隔（秒） |
+| `RATE_LIMIT_COOLDOWN` | 60s | 429 错误最低冷却时间 |
+| `KEYWORD_SAMPLE_THRESHOLD` | 1000 行 | 超过此行数启用采样式关键词提取 |
+| `KEYWORD_SAMPLE_LINES` | 300 行 | 每段采样行数（开头/中间/结尾） |
+| `CONSECUTIVE_FAIL_LIMIT` | 3 | 连续失败上限，超过后暂停 pipeline |
+| `GLOBAL_PAUSE_DURATION` | 120s | 错误预算耗尽后的暂停时间 |
+| `MIN_CHUNK_DELAY` / `MAX_CHUNK_DELAY` | 2s / 30s | 自适应延迟范围 |
 | `temperature` | 0.1 | 生成温度，越低越稳定 |
 
 ### 分辨率预设（自动检测）
@@ -147,7 +178,9 @@ python bilingual_subtitle_generator.py \
 | 字幕太小或太大 | 分辨率参数不匹配 | 脚本已自动检测，如需微调可修改脚本内的预设值 |
 | 烧录速度慢 | 软编码 | 使用 `--hwaccel` 启用硬件加速 |
 | API 503/断连错误 | Gemini 模型过载 | 脚本内置指数退避重试，通常自动恢复 |
-| 中途失败 | 网络/API 问题 | 直接重跑脚本，checkpoint 自动续传 |
+| API 429 限流 | 请求过于频繁 | 脚本自动检测 429，应用 60 秒冷却；连续失败后暂停 120 秒 |
+| 长视频处理不稳定 | 请求体积过大/配额不足 | 使用 `--chunk-size 100` 缩小请求；采样式关键词提取自动启用 |
+| 中途失败 | 网络/API 问题 | 直接重跑脚本，checkpoint 自动续传（关键词也从缓存加载） |
 
 ## File Structure
 
