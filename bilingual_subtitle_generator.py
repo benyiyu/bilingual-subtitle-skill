@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bilingual Subtitle Generator v2.0
+Bilingual Subtitle Generator v2.1
 
 CLI tool that generates Netflix-level bilingual subtitles from SRT files
 using Google Gemini API with automatic keyword extraction and checkpoint resume.
@@ -8,19 +8,24 @@ using Google Gemini API with automatic keyword extraction and checkpoint resume.
 Usage:
     python bilingual_subtitle_generator.py --input "/path/to/input.srt"
     python bilingual_subtitle_generator.py --input "/path/to/input.srt" --output-srt "/path/to/out.srt" --output-json "/path/to/out.json"
+    python bilingual_subtitle_generator.py --input "/path/to/input.srt" --keywords "Clawd:AI assistant, Claude Code:coding tool"
+    python bilingual_subtitle_generator.py --input "/path/to/input.srt" --model gemini-2.5-flash
 """
 
-import argparse
 import os
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+import argparse
 import json
+import re
 import time
 from google import genai
 from google.genai import types
 
 # ================= Constants =================
-MODEL_NAME = "gemini-2.0-flash"
-CHUNK_SIZE = 300
-KEYWORD_SAMPLE_LINES = 200
+DEFAULT_MODEL = "gemini-2.5-flash"
+FALLBACK_MODEL = "gemini-3-flash-preview"
+CHUNK_SIZE = 150
 BACKOFF_SCHEDULE = [5, 15, 45, 90, 180]  # seconds, up to 5 retries
 # ==============================================
 
@@ -62,6 +67,14 @@ def parse_args():
         "--output-json", default=None,
         help="Path to output bilingual JSON file (default: <input>_bilingual.json)"
     )
+    parser.add_argument(
+        "--keywords", default=None,
+        help='Manual keyword injection. Format: "term:description, term:description" (appended to auto-extracted keywords)'
+    )
+    parser.add_argument(
+        "--model", default=DEFAULT_MODEL,
+        help=f"Gemini model to use (default: {DEFAULT_MODEL})"
+    )
     args = parser.parse_args()
 
     # Auto-generate output paths if not specified
@@ -86,12 +99,29 @@ def read_file(filepath):
 
 # ================= Phase 0: Auto Keyword Extraction =================
 
-def extract_keywords(client, all_lines):
+def parse_manual_keywords(keywords_str):
+    """Parse manual --keywords string into formatted keyword lines."""
+    if not keywords_str:
+        return ""
+    lines = []
+    for pair in keywords_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" in pair:
+            term, desc = pair.split(":", 1)
+            lines.append(f"- {term.strip()} ({desc.strip()})")
+        else:
+            lines.append(f"- {pair}")
+    return "\n".join(lines)
+
+
+def extract_keywords(client, all_lines, model_name):
     """
-    Phase 0: Send first N lines of SRT to Gemini to auto-extract keywords.
+    Phase 0: Send full SRT text to Gemini to auto-extract keywords.
     Returns a keyword string for injection into the translation system prompt.
     """
-    sample = "\n".join(all_lines[:KEYWORD_SAMPLE_LINES])
+    sample = "\n".join(all_lines)
 
     keyword_prompt = """Analyze this SRT subtitle transcript sample. Extract all important keywords that need special attention during translation, including:
 
@@ -111,13 +141,13 @@ Only include terms that genuinely appear or are referenced in the transcript. Do
         temperature=0.1,
     )
 
-    print("Phase 0: Extracting keywords from transcript sample...")
+    print("Phase 0: Extracting keywords from full transcript...")
 
     for attempt, wait in enumerate(BACKOFF_SCHEDULE):
         try:
             response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=f"SRT Transcript Sample:\n{sample}",
+                model=model_name,
+                contents=f"SRT Transcript:\n{sample}",
                 config=types.GenerateContentConfig(
                     system_instruction=keyword_prompt,
                     response_mime_type="application/json",
@@ -195,9 +225,9 @@ Your task is to process raw ASR (speech-to-text) transcripts. The transcripts ma
 """
 
 
-def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks):
+def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks, model_name):
     """Call Gemini API to process a single chunk with exponential backoff."""
-    print(f"Processing chunk {chunk_index}/{total_chunks} ({len(chunk_text)} chars)...")
+    print(f"Processing chunk {chunk_index}/{total_chunks} ({len(chunk_text)} chars) with {model_name}...")
 
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
@@ -214,7 +244,7 @@ def process_chunk(client, system_prompt, chunk_text, chunk_index, total_chunks):
     for attempt, wait in enumerate(BACKOFF_SCHEDULE):
         try:
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=model_name,
                 contents=f"Raw Transcript Chunk ({chunk_index}/{total_chunks}):\n{chunk_text}",
                 config=config
             )
@@ -270,16 +300,48 @@ def save_checkpoint(checkpoint_path, completed_chunks, subtitles, total_chunks):
 
 # ================= Output =================
 
+def normalize_timestamp(raw):
+    """
+    Normalize a timestamp string to SRT format HH:MM:SS,mmm.
+    Handles formats like MM:SS, MM:SS.ms, HH:MM:SS.ms, HH:MM:SS,mmm, etc.
+    """
+    # Strip commas that Gemini may insert (e.g. "00:16:11,560,000")
+    raw = raw.replace(',', '.')
+    # Count colons to distinguish MM:SS vs HH:MM:SS before splitting
+    colon_count = raw.count(':')
+    # Split on ':' and '.' to extract numeric parts
+    parts = re.split(r'[:.]', raw)
+    parts = [p for p in parts if p]  # remove empty strings
+
+    if len(parts) == 2:
+        # MM:SS
+        hours, minutes, seconds, millis = 0, int(parts[0]), int(parts[1]), 0
+    elif len(parts) == 3:
+        if colon_count >= 2:
+            # HH:MM:SS (no millis)
+            hours, minutes, seconds, millis = int(parts[0]), int(parts[1]), int(parts[2]), 0
+        else:
+            # MM:SS.ms
+            hours, minutes = 0, int(parts[0])
+            seconds = int(parts[1])
+            millis = int(parts[2][:3].ljust(3, '0'))
+    elif len(parts) >= 4:
+        # HH:MM:SS.ms (or more parts from extra commas/dots)
+        hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2])
+        millis = int(parts[3][:3].ljust(3, '0'))
+    else:
+        hours, minutes, seconds, millis = 0, 0, 0, 0
+
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
 def json_to_srt(json_data):
     """Convert JSON subtitle data to SRT format."""
     srt_content = ""
     counter = 1
     for item in json_data:
-        timestamp = item.get('start', '00:00').replace('.', ':')
-        if len(timestamp.split(':')) == 2:
-            timestamp = "00:" + timestamp
-
-        start_time = f"{timestamp},000"
+        raw_timestamp = item.get('start', '00:00')
+        start_time = normalize_timestamp(raw_timestamp)
         end_time = "00:00:00,000"
 
         en_text = item.get('en', '').strip()
@@ -311,8 +373,20 @@ def main():
         print("Error: Input file is empty or unreadable.")
         exit(1)
 
-    # Phase 0: Auto keyword extraction
-    video_keywords = extract_keywords(client, all_lines)
+    # Phase 0: Auto keyword extraction + manual keywords
+    model_name = args.model
+    print(f"Using model: {model_name} (fallback: {FALLBACK_MODEL})")
+    video_keywords = extract_keywords(client, all_lines, model_name)
+
+    # Merge manual keywords if provided
+    manual_kw = parse_manual_keywords(args.keywords)
+    if manual_kw:
+        print(f"  Injecting manual keywords.")
+        if video_keywords:
+            video_keywords = video_keywords + "\n" + manual_kw
+        else:
+            video_keywords = manual_kw
+
     system_prompt = build_system_prompt(video_keywords)
 
     # Chunk the input
@@ -344,7 +418,12 @@ def main():
             continue
 
         chunk_text = "\n".join(chunk)
-        result = process_chunk(client, system_prompt, chunk_text, idx + 1, total_chunks)
+        result = process_chunk(client, system_prompt, chunk_text, idx + 1, total_chunks, model_name)
+
+        # Fallback: if primary model failed, retry with fallback model
+        if result is None and model_name != FALLBACK_MODEL:
+            print(f"  Primary model failed. Retrying chunk {idx + 1} with fallback model {FALLBACK_MODEL}...")
+            result = process_chunk(client, system_prompt, chunk_text, idx + 1, total_chunks, FALLBACK_MODEL)
 
         if result:
             full_subtitles.extend(result)
@@ -352,7 +431,7 @@ def main():
             save_checkpoint(checkpoint_path, completed_chunks, full_subtitles, total_chunks)
             print(f"  Chunk {idx + 1} saved to checkpoint.")
         else:
-            print(f"WARNING: Chunk {idx + 1} failed after all retries, skipped.")
+            print(f"WARNING: Chunk {idx + 1} failed after all retries (both models), skipped.")
 
         # Brief pause between chunks to avoid rate limiting
         if idx < len(chunks) - 1:

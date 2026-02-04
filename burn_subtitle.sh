@@ -1,5 +1,5 @@
 #!/bin/bash
-# Netflix-style bilingual subtitle burn script v2.0
+# Netflix-style bilingual subtitle burn script v2.1
 #
 # Usage:
 #   ./burn_subtitle.sh <input_video> <subtitle.srt> <output_video> [--hwaccel]
@@ -96,15 +96,21 @@ if [ "$HWACCEL" = true ]; then
     echo "Hardware acceleration enabled (h264_videotoolbox)"
 fi
 
+# Create safe symlink to avoid special characters (e.g. single quotes) conflicting with force_style
+SAFE_SRT="/tmp/subtitle_$(date +%s).srt"
+ln -sf "$(cd "$(dirname "$SUBTITLE_SRT")" && pwd)/$(basename "$SUBTITLE_SRT")" "$SAFE_SRT"
+
 echo "Burning subtitles..."
 $FFMPEG -y \
   -i "$INPUT_VIDEO" \
-  -vf "subtitles=$SUBTITLE_SRT:fontsdir=$FONTS_DIR:force_style='FontName=PingFang SC,FontSize=$FONT_SIZE,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,Alignment=2,MarginV=$MARGIN_V'" \
+  -vf "subtitles=$SAFE_SRT:fontsdir=$FONTS_DIR:force_style='FontName=PingFang SC,FontSize=$FONT_SIZE,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,Alignment=2,MarginV=$MARGIN_V'" \
   -c:a copy \
   $CODEC_OPTS \
   "$OUTPUT_VIDEO"
 
 STATUS=$?
+rm -f "$SAFE_SRT"  # cleanup temp symlink
+
 if [ $STATUS -eq 0 ]; then
     echo ""
     echo "========================================"

@@ -5,9 +5,9 @@ argument-hint: "<srt字幕文件路径> <视频文件路径>"
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-# Bilingual Subtitle Video Generator v2.0
+# Bilingual Subtitle Video Generator v2.1
 
-根据用户提供的 SRT 字幕文件，通过 CLI 工具（Gemini API + 自动关键词提取 + ASR 纠错）生成 Netflix 级别的双语字幕 SRT，经用户确认后，使用 FFmpeg 将字幕烧录进视频，输出带硬字幕的成品视频。
+根据用户提供的 SRT 字幕文件，通过 CLI 工具（Gemini API + 自动关键词提取 + ASR 纠错 + 手动术语注入 + 备用模型自动切换）生成 Netflix 级别的双语字幕 SRT，经用户确认后，使用 FFmpeg 将字幕烧录进视频，输出带硬字幕的成品视频。
 
 ## 完整工作流程
 
@@ -35,16 +35,26 @@ cd "<skill_directory>" && python bilingual_subtitle_generator.py --input "<srt�
 
 输出文件自动生成在输入文件同目录，后缀 `_bilingual.srt` / `_bilingual.json`。
 
-也可以手动指定输出路径：
+可选参数：
 
 ```bash
 python bilingual_subtitle_generator.py \
   --input "<srt文件路径>" \
   --output-srt "<输出srt路径>" \
-  --output-json "<输出json路径>"
+  --output-json "<输出json路径>" \
+  --keywords "Clawd:OpenClaw的AI助手, Claude Code:Anthropic的编码工具" \
+  --model gemini-2.5-flash
 ```
 
-> **不需要**手动编辑脚本配置、不需要读取 SRT 内容、不需要手写关键词表。脚本自动完成关键词提取。
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--input` | 输入 SRT 文件路径（必填） | — |
+| `--output-srt` | 输出双语 SRT 路径 | `<input>_bilingual.srt` |
+| `--output-json` | 输出双语 JSON 路径 | `<input>_bilingual.json` |
+| `--keywords` | 手动注入术语，格式 `term:description, ...`，追加到自动提取结果 | 无 |
+| `--model` | 指定 Gemini 模型 | `gemini-2.5-flash` |
+
+> **不需要**手动编辑脚本配置、不需要读取 SRT 内容。脚本自动完成全文关键词提取，`--keywords` 用于补充自动提取遗漏的术语。
 
 2. **读取生成的双语 SRT 文件前 15 条字幕**预览：
 
@@ -117,3 +127,4 @@ head -60 "<输出srt路径>"
 | API 503/断连 | 脚本内置指数退避重试（5→15→45→90→180 秒），通常自动恢复 |
 | 中途失败 | 直接重跑脚本，checkpoint 自动续传 |
 | 烧录速度慢 | 使用 `--hwaccel` 开启硬件加速 |
+| 文件名含特殊字符（如 `'`）导致烧录失败 | v2.1 已修复：脚本自动创建临时 symlink 避免冲突 |
