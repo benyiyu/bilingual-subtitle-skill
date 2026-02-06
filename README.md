@@ -6,7 +6,7 @@
 
 - **CLI 工具化**：通过命令行参数传入文件路径，无需手动编辑脚本配置
 - **自动关键词提取**：Gemini 自动分析字幕内容，提取人名、术语、品牌名等关键词用于 ASR 纠错
-- **采样式关键词提取**：长 transcript（>1000 行）自动采样开头/中间/结尾，避免超大请求失败
+- **全文关键词提取**：始终使用完整 transcript 提取关键词，确保不遗漏重要术语
 - **关键词缓存**：提取结果保存到 checkpoint，resume 时直接复用，不重复调用 API
 - **手动术语注入**：`--keywords` 参数补充自动提取遗漏的专业术语
 - **ASR 纠错**：基于术语表修正语音识别错误（如 "white coding" → "vibe coding"）
@@ -134,7 +134,7 @@ python bilingual_subtitle_generator.py \
 | `--output-json` | `<input>_bilingual.json` | 输出双语 JSON 路径 |
 | `--keywords` | 无 | 手动术语注入，格式 `term:desc, term:desc` |
 | `--model` | `gemini-2.5-flash` | Gemini 模型（备用: `gemini-3-flash-preview`） |
-| `--chunk-size` | 150 | 每块行数，越小请求越轻量但调用次数越多 |
+| `--chunk-size` | 30 | 每块字幕数，越小请求越轻量但调用次数越多 |
 
 ### 内部常量
 
@@ -142,8 +142,8 @@ python bilingual_subtitle_generator.py \
 |------|---|------|
 | `BACKOFF_SCHEDULE` | [5, 15, 45, 90, 180] | 指数退避重试间隔（秒） |
 | `RATE_LIMIT_COOLDOWN` | 60s | 429 错误最低冷却时间 |
-| `KEYWORD_SAMPLE_THRESHOLD` | 1000 行 | 超过此行数启用采样式关键词提取 |
-| `KEYWORD_SAMPLE_LINES` | 300 行 | 每段采样行数（开头/中间/结尾） |
+| `KEYWORD_SAMPLE_THRESHOLD` | 99999 | 禁用采样，始终全文提取关键词 |
+| `KEYWORD_SAMPLE_LINES` | 99999 | 禁用采样，始终全文提取关键词 |
 | `CONSECUTIVE_FAIL_LIMIT` | 3 | 连续失败上限，超过后暂停 pipeline |
 | `GLOBAL_PAUSE_DURATION` | 120s | 错误预算耗尽后的暂停时间 |
 | `MIN_CHUNK_DELAY` / `MAX_CHUNK_DELAY` | 2s / 30s | 自适应延迟范围 |

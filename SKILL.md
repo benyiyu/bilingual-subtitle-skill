@@ -5,7 +5,7 @@ argument-hint: "<srt字幕文件路径> <视频文件路径>"
 allowed-tools: Bash, Read, AskUserQuestion
 ---
 
-# Bilingual Subtitle Video Generator v2.1
+# Bilingual Subtitle Video Generator v2.6
 
 根据用户提供的 SRT 字幕文件，通过 CLI 工具（Gemini API + 自动关键词提取 + ASR 纠错 + 手动术语注入 + 备用模型自动切换）生成 Netflix 级别的双语字幕 SRT，经用户确认后，使用 FFmpeg 将字幕烧录进视频，输出带硬字幕的成品视频。
 
